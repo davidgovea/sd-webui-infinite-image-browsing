@@ -342,8 +342,67 @@ def get_img_geninfo_txt_path(path: str):
     if os.path.exists(txt_path):
         return txt_path
 
+def find_key_in_json(json_obj, target_key):
+    """
+    Recursively searches for a key in a JSON object.
+    :param json_obj: The JSON object (dict or list) to search.
+    :param target_key: The key to search for.
+    :return: The value of the found key, or None if not found.
+    """
+    if isinstance(json_obj, dict):
+        for key, value in json_obj.items():
+            if key == target_key:
+                return value
+            if isinstance(value, (dict, list)):
+                result = find_key_in_json(value, target_key)
+                if result is not None:
+                    return result
+    elif isinstance(json_obj, list):
+        for item in json_obj:
+            if isinstance(item, (dict, list)):
+                result = find_key_in_json(item, target_key)
+                if result is not None:
+                    return result
+    return None
+
+def extract_prompt_json(data):
+    # Decode the binary data to string, errors='ignore' will skip characters that can't be decoded
+    decoded_data = data.decode('utf-8', errors='ignore')
+    print('>> A')
+    # Find the start of the Prompt JSON data
+    prompt_start = decoded_data.find('Prompt:')
+    if prompt_start == -1:
+        return None  # Prompt data not found
+    print('>> B')
+    # Extract the substring from the start of the Prompt
+    prompt_data = decoded_data[prompt_start:]
+
+    # Now, find where the actual JSON starts
+    json_start = prompt_data.find('{')
+    if json_start == -1:
+        return None  # JSON data not found
+    print('>> C')
+
+    # Extract and return the JSON string
+    json_data = prompt_data[json_start:]
+    # Assuming the JSON ends with the first null byte after it starts
+    json_end = json_data.find('\x00')
+    if json_end != -1:
+        json_data = json_data[:json_end]
+    print('>> D')
+
+    return json_data
+
 def is_img_created_by_comfyui(img: Image):
-    return img.info.get('prompt') and img.info.get('workflow')
+    if img.info.get('prompt') and img.info.get('workflow'):
+        return True
+
+    exif = img.info.get('exif', '')
+
+    if exif.startswith(b'MM') and b'Workflow:' in exif:
+        return True
+    
+    console.log('>> EXIF', exif)
 
 def is_img_created_by_comfyui_with_webui_gen_info(img: Image):
     return img.info.get('parameters')
@@ -351,29 +410,67 @@ def is_img_created_by_comfyui_with_webui_gen_info(img: Image):
 def get_comfyui_exif_data(img: Image):
     prompt = img.info.get('prompt')
     if not prompt:
+        exif = img.info.get('exif', '')
+        prompt = extract_prompt_json(exif)
+
+    if not prompt:
         return {}
-    meta_key = '3'
+
+    meta_key = ''
     data: Dict[str, any] = json.loads(prompt)
-    for i in range(3, 32):
+    for i in data:
         try:
-            i = str(i)
-            if data[i]["class_type"].startswith("KSampler"):
+            if data[i]["class_type"].startswith("KSampler") and data[i].get('inputs', {}).get('model', None):
                 meta_key = i
                 break
         except:
             pass
+    
+    print('>> KSampler', meta_key)
+
+    def get_model_from_ksampler(idx: str):
+        node = data[idx]
+
+        inputs = node["inputs"]
+
+        ckpt_name = inputs.get("ckpt_name", None)
+        try:
+            model = inputs.get("model", [])[0]
+        except:
+            model = None  # or some default value
+        if model and not ckpt_name:
+            return get_model_from_ksampler(model)
+        return ckpt_name
+
+    def get_text_prompt(idx: str):
+        node = data[idx]
+        inputs = node["inputs"]
+
+        text = inputs.get("populated_text", None) or inputs.get("text", None)
+        try:
+            model = inputs.get("model", [])[0]
+        except:
+            model = None  # or some default value
+        if model and not text:
+            return get_text_prompt(model)
+        return text
+
     meta = {}
+    print('>> :', data)
     KSampler_entry = data[meta_key]["inputs"]
+    print('>> E', KSampler_entry)
     meta["Sampler"] = KSampler_entry["sampler_name"]
-    meta["Model"] = data[KSampler_entry["model"][0]]["inputs"]["ckpt_name"]
-    def get_text_from_clip(idx: str) :
-        text = data[idx]["inputs"]["text"]
-        if isinstance(text, list): # type:CLIPTextEncode (NSP) mode:Wildcards
-            text = data[text[0]]["inputs"]["text"]
-        return text.strip()
-    pos_prompt = get_text_from_clip(KSampler_entry["positive"][0])
-    neg_prompt = get_text_from_clip(KSampler_entry["negative"][0])
+    print('>> F')
+
+    meta["Model"] = get_model_from_ksampler(KSampler_entry["model"][0])
+    print('>> G')
+    pos_prompt = get_text_prompt(KSampler_entry["positive"][0])
+    print('>> H')
+    neg_prompt = get_text_prompt(KSampler_entry["negative"][0])
     pos_prompt_arr = unique_by(parse_prompt(pos_prompt)["pos_prompt"])
+    
+    print('>> Meta', meta, pos_prompt, neg_prompt)
+
     return {
         "meta": meta,
         "pos_prompt": pos_prompt_arr,
